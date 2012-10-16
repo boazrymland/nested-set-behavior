@@ -284,10 +284,184 @@ class NestedSetBehavior extends CActiveRecordBehavior
 	 * Deletes node and it's descendants.
 	 * @return boolean whether the deletion is successful.
 	 */
-	public function deleteNode()
+	public function deleteNodeWithChildren()
 	{
 		return $this->delete();
 	}
+
+	/**
+	 * Deletes a node but not its descendants:
+	 * - If the node is a root node:
+	 *     if we're in 'many roots mode' - its children will become roots as well and this node will be deleted
+	 *     if we're not in 'many roots mode' and more than 1 children exists - exception will be thrown. If only one child exists
+	 *             it will be promoted to the root and the current, 'old' root will be deleted. If no children exists, node will be
+	 *             deleted.
+	 * - If the node is a parent (but NOT a root node):
+	 *     its children (if any) will be children of this node's parent
+	 * - If the node is a leaf - normal deletion will follow
+	 *
+	 * @return boolean whether the deletion is successful.
+	 * @throws CException
+	 * @throws Exception
+	 */
+	public function deleteNodeKeepChildren() {
+		$owner = $this->getOwner();
+		$children = $owner->children()->findAll();
+
+		if ($owner->isRoot()) {
+			if (!$this->hasManyRoots) {
+				if (count($children) > 1) {
+					/*
+					 * this is "single root" therefore its unclear how the children shall be treated
+					 */
+					throw new CException(Yii::t('yiiext', 'Cannot delete root in single root mode while this root has more ' .
+						'than 1 child - I do not know how to handle the children!'));
+				}
+				else if (count($children) == 1) {
+					/*
+					 * 1 child in a single root use case - kill the old king and crown the heir
+					 */
+					$heir = array_pop($children);
+
+
+					$db = $owner->getDbConnection();
+					if ($db->getCurrentTransaction() === null)
+						$transaction = $db->beginTransaction();
+
+					try {
+						// delete current root before attempting to make a new one
+						$result = $owner->deleteByPk($owner->primaryKey);
+						// clear... make a new root
+						$result = $result && $heir->moveAsRoot();
+
+						if (!$result) {
+							if (isset($transaction))
+								$transaction->rollback();
+
+							return false;
+						}
+
+						if (isset($transaction))
+							$transaction->commit();
+					} catch (Exception $e) {
+						if (isset($transaction))
+							$transaction->rollback();
+
+						throw $e;
+					}
+				}
+				else {
+					/*
+					 * num of child of this root is zero. simply delete it... .
+					 */
+					return $owner->deleteNodeWithChildren();
+				}
+			}
+			else {
+				/*
+				 * use case here: root node in "many roots" setup. first make each of its children a root on its own and
+				 * then delete the root node.
+				 */
+				$db = $owner->getDbConnection();
+				if ($db->getCurrentTransaction() === null)
+					$transaction = $db->beginTransaction();
+
+				try {
+					foreach ($children as $child) {
+						$child_class = get_class($child);
+						$reloaded_child = $child_class::model()->findByPk($child->primaryKey);
+						$result = $reloaded_child->moveAsRoot();
+						if (!$result) {
+							if (isset($transaction))
+								$transaction->rollback();
+
+							return false;
+						}
+					}
+
+					// delete the original root node
+					$result = $owner->deleteNodeWithChildren();
+					if (!$result) {
+						if (isset($transaction))
+							$transaction->rollback();
+
+						return false;
+					}
+
+					if (isset($transaction))
+						$transaction->commit();
+				} catch (Exception $e) {
+					$transaction->rollback();
+					if (isset($transaction))
+						throw $e;
+				}
+			}
+		}
+		else if (count($children) > 0) {
+			/*
+			 * this is a parent node (but not root). bubble up the children to be children of this owner's parent
+			 * and then delete owner.
+			 */
+			$db = $owner->getDbConnection();
+			if ($db->getCurrentTransaction() === null)
+				$transaction = $db->beginTransaction();
+
+			try {
+				$parent = $owner->parent()->find();
+				foreach ($children as $child) {
+					$to_be_brothers = $parent->children()->findAll(
+						array(
+							'condition' => 'id!=:id',
+							'params' => array(':id' => $owner->id),
+						)
+					);
+					// in between iterations of this foreach the $children lft,rgt,root,level values are changing
+					// due to the usage of moveAfter() on their "family tree". Therefore, to maintain integrity we
+					// must 'refresh' each child tree before handling it, by reloading it
+					$child_class = get_class($child);
+					$reloaded_child = $child_class::model()->findByPk($child->primaryKey);
+					// if $owner was the only child of its parent then to_be_brothers will be empty. therefore, we need
+					// to move the $reloaded child node using the correct method
+					if (count($to_be_brothers) == 0) {
+						$result = $reloaded_child->moveAsFirst($parent);
+					}
+					else {
+						$result = $reloaded_child->moveAfter(array_pop($to_be_brothers));
+					}
+					if (!$result) {
+						if (isset($transaction))
+							$transaction->rollback();
+
+						return false;
+					}
+				}
+
+				// delete the original parent node
+				$result = $owner->deleteNodeWithchildren();
+				if (!$result) {
+					if (isset($transaction))
+						$transaction->rollback();
+
+					return false;
+				}
+
+				if (isset($transaction))
+					$transaction->commit();
+			} catch (Exception $e) {
+				$transaction->rollback();
+				if (isset($transaction))
+					throw $e;
+			}
+		}
+		else {
+			/*
+			 * Not a parent or root node but rather a simple leaf. Delete it
+			 */
+			return $owner->deleteNodeWithChildren();
+		}
+		return true;
+	}
+
 
 	/**
 	 * Prepends node to target as first child.
@@ -412,9 +586,11 @@ class NestedSetBehavior extends CActiveRecordBehavior
 	{
 		$owner=$this->getOwner();
 
-		if(!$this->hasManyRoots)
-			throw new CException(Yii::t('yiiext','Many roots mode is off.'));
-
+		if (!$this->hasManyRoots) {
+			if ($owner->roots()->find()) {
+				throw new CException(Yii::t('yiiext', 'Many roots mode is off and a root is already defined.'));
+			}
+		}
 		if($owner->getIsNewRecord())
 			throw new CException(Yii::t('yiiext','The node should not be new record.'));
 
